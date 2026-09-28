@@ -5,7 +5,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
-LOG = logging.getLogger("smallfish-public-v8")
+LOG = logging.getLogger("smallfish-public-v9")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "LINKUSDT,BTCUSDT,ETHUSDT,NEARUSDT,PYTHUSDT,ADAUSDT,SOLUSDT,SUIUSDT,DOGEUSDT").split(",") if s.strip()]
@@ -16,6 +16,8 @@ SWEEP_LOOKBACK = int(os.getenv("SWEEP_LOOKBACK", "12"))
 SWEEP_MAX_AGE = int(os.getenv("SWEEP_MAX_AGE", "12"))
 FRESH_SWEEP_AGE = int(os.getenv("FRESH_SWEEP_AGE", "4"))
 MAX_EXTENSION_ATR = float(os.getenv("MAX_EXTENSION_ATR", "2.20"))
+EARLY_EXTENSION_ATR = float(os.getenv("EARLY_EXTENSION_ATR", "1.80"))
+EARLY_SWEEP_AGE = int(os.getenv("EARLY_SWEEP_AGE", "3"))
 MIN_ROOM_PCT = float(os.getenv("MIN_ROOM_PCT", "0.35"))
 DIAG = os.getenv("DIAGNOSTICS", "true").lower() in {"1", "true", "yes", "on"}
 MEXC = "https://api.mexc.com"
@@ -190,23 +192,34 @@ def analyze(h,m15,c5,c1m,c10,b,a):
     entry=c1m[-1][4]; oi=obi(b,a); best=None
     for side in ("LONG","SHORT"):
         sw=sweep(c10,side)
-        if not sw:continue
+        if not sw: continue
         ch,chl=choch(c10,sw,side)
-        if not ch:continue
         bs=bias(h,m15,side); f=five(c5,side); mic=micro(c1m,side)
         loc,lt,ext=location(c5,side,sw,entry)
         ob=(oi>=0.08) if side=="LONG" else (oi<=-0.08)
         vol=c5[-1][5]; av=sum(x[5] for x in c5[-21:-1])/20; vr=vol/av if av else 1
-        vs=vr>=0.80
-        fresh=sw["age"]<=FRESH_SWEEP_AGE
-        score=2+min(bs,3)+int(f)+int(mic)+int(ob)+int(vs)+int(fresh)
+        vs=vr>=0.80; fresh=sw["age"]<=FRESH_SWEEP_AGE
+        # A setup can be armed early, immediately after the sweep/reclaim/CHoCH.
+        # It becomes a tradable signal only when the short-term trigger is aligned.
+        early=fresh and sw["age"]<=EARLY_SWEEP_AGE and bs>=2 and ch and ob and vs
+        score=2+min(bs,3)+int(ch)+int(f)+int(mic)+int(ob)+int(vs)+int(fresh)
         zone_lo,zone_hi=zone(sw,chl,side)
-        ready=fresh and bs>=2 and f and mic and ob and vs and loc and score>=MIN_SCORE
-        # A setup with a valid pattern but an extended market is never labeled LONG/SHORT; it is WAIT.
-        wait=lt if not loc else ("sweep is not fresh" if not fresh else "waiting for confirmations")
-        x={"ready":ready,"side":side,"entry":entry,"score":score,"sweep":sw,"choch":chl,"bias":bs,"five":f,"micro":mic,"obi":oi,"volume":vr,"loc":loc,"loc_text":lt,"ext":ext,"zone_lo":zone_lo,"zone_hi":zone_hi,"wait":wait,"fresh":fresh}
-        if best is None or x["score"]>best["score"]:best=x
-    return best or {"ready":False,"wait":"no sweep + CHoCH setup","entry":entry}
+        ready=fresh and bs>=2 and ch and f and mic and ob and vs and loc and score>=MIN_SCORE
+        # If price has already run too far, never call it a market signal.
+        # Instead expose an EARLY/ARMED setup only when the sweep itself is still recent.
+        if not ready and early and (not loc) and ext>EARLY_EXTENSION_ATR:
+            wait=f"EARLY {side} | sweep/CHoCH confirmed; entry zone {zone_lo:.6g}-{zone_hi:.6g}; market extended {ext:.2f} ATR"
+        elif not ready and early:
+            wait=f"EARLY {side} | sweep/CHoCH confirmed; waiting for 5m/1m trigger"
+        elif not ch:
+            wait="sweep found; waiting for 10m CHoCH"
+        elif not sw:
+            wait="no fresh sweep"
+        else:
+            wait=lt if not loc else ("sweep is not fresh" if not fresh else "waiting for confirmations")
+        x={"ready":ready,"early":early,"side":side,"entry":entry,"score":score,"sweep":sw,"choch":chl,"bias":bs,"five":f,"micro":mic,"obi":oi,"volume":vr,"loc":loc,"loc_text":lt,"ext":ext,"zone_lo":zone_lo,"zone_hi":zone_hi,"wait":wait,"fresh":fresh}
+        if best is None or x["score"]>best["score"]: best=x
+    return best or {"ready":False,"early":False,"wait":"no fresh sweep","entry":entry}
 
 def signal(sym,m):
     e=m["entry"]; sw=m["sweep"]; a=sw["atr"]
@@ -227,9 +240,22 @@ def signal(sym,m):
 
 def diag(sym,m):
     if "side" not in m:return f"{sym} | WAIT | {m['wait']}"
-    return (f"{sym} | {'SIGNAL' if m['ready'] else 'WAIT'} {m['side']} | score={m['score']:.0f}/10 | "
+    state='SIGNAL' if m['ready'] else ('EARLY' if m.get('early') else 'WAIT')
+    return (f"{sym} | {state} {m.get('side','')} | score={m.get('score',0):.0f}/10 | "
             f"age={m['sweep']['age']} | bias={m['bias']}/4 | 5m={'Y' if m['five'] else 'N'} | 1m={'Y' if m['micro'] else 'N'} | "
             f"OBI={m['obi']:+.2f} | V={m['volume']:.2f}x | ext={m['ext']:.2f}ATR | {m['wait']}")
+
+def early_signal(sym,m):
+    side=m["side"]; icon="🟢 LONG SETUP" if side=="LONG" else "🔴 SHORT SETUP"
+    return (f"🐟 SMALLFISH V9 EARLY\n\n{icon} {sym}\n\n"
+            f"Entry zone: {m['zone_lo']:.6g} - {m['zone_hi']:.6g}\n"
+            f"Current: {m['entry']:.6g}\n"
+            f"Sweep: {'SELL-SIDE' if side=='LONG' else 'BUY-SIDE'} ✓\n"
+            f"10m CHoCH: ✓\n1H/15m bias: {m['bias']}/4\n"
+            f"5m trigger: {'✓' if m['five'] else 'waiting'}\n"
+            f"1m trigger: {'✓' if m['micro'] else 'waiting'}\n"
+            f"OBI: {m['obi']:+.2f}\nVolume: {m['volume']:.2f}x\n\n"
+            f"⚠️ Early setup: wait for entry-zone/retest confirmation. No orders are placed.")
 
 async def telegram(s,text):
     if not TOKEN or not CHAT:return
@@ -238,12 +264,12 @@ async def telegram(s,text):
 
 async def main():
     logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
-    LOG.info("SMALLFISH PUBLIC SIGNAL MODE v8 started | %d symbols | poll=%ss",len(SYMBOLS),POLL)
+    LOG.info("SMALLFISH PUBLIC SIGNAL MODE v9 started | %d symbols | poll=%ss",len(SYMBOLS),POLL)
     LOG.info("MEXC public market data only | no API key/secret | no orders")
-    LOG.info("V8 pattern: sweep -> 10m CHoCH -> fresh bias -> 5m -> 1m trigger -> entry zone")
-    async with aiohttp.ClientSession(headers={"User-Agent":"smallfish-public-signal/8.0"}) as s:
+    LOG.info("V9 pattern: sweep -> 10m CHoCH -> fresh bias -> 5m -> 1m trigger -> entry zone")
+    async with aiohttp.ClientSession(headers={"User-Agent":"smallfish-public-signal/9.0"}) as s:
         if TOKEN and CHAT:
-            try: await telegram(s,"🐟 SMALLFISH V8 ONLINE\nLiquidity sweep → 10m CHoCH → 1H/15m bias → 5m → 1m trigger → entry zone.\nMEXC public data only. No orders.")
+            try: await telegram(s,"🐟 SMALLFISH V9 ONLINE\nLiquidity sweep → 10m CHoCH → early setup → 5m → 1m trigger → entry zone.\nMEXC public data only. No orders.")
             except Exception as e: LOG.warning("Telegram startup failed: %s",e)
         while True:
             started=time.monotonic(); signals=0
@@ -254,11 +280,14 @@ async def main():
                     if len(c10)<25:raise RuntimeError(f"not enough derived 10m candles: {len(c10)}")
                     b,a=await book(s,sym); m=analyze(h,m15,c5,c1,c10,b,a)
                     if DIAG:LOG.info("%s",diag(sym,m))
-                    if not m.get("ready"):continue
-                    key=f"{sym}:{m['side']}"; now=time.time()
+                    if not m.get("ready") and not m.get("early"):continue
+                    key=f"{sym}:{m['side']}:{'final' if m.get('ready') else 'early'}"; now=time.time()
                     if now-last_alert.get(key,0)<COOLDOWN:continue
-                    await telegram(s,signal(sym,m)); last_alert[key]=now; signals+=1
-                    LOG.info("SIGNAL %s %s score=%s zone=%s-%s",m["side"],sym,m["score"],m["zone_lo"],m["zone_hi"])
+                    await telegram(s,signal(sym,m) if m.get('ready') else early_signal(sym,m)); last_alert[key]=now
+                    if m.get('ready'):
+                        signals+=1; LOG.info("SIGNAL %s %s score=%s zone=%s-%s",m["side"],sym,m["score"],m["zone_lo"],m["zone_hi"])
+                    else:
+                        LOG.info("EARLY SETUP %s %s score=%s zone=%s-%s",m["side"],sym,m["score"],m["zone_lo"],m["zone_hi"])
                 except Exception as e:LOG.warning("%s scan failed: %s",sym,e)
             elapsed=time.monotonic()-started; LOG.info("scan complete | %.1fs | signals=%s",elapsed,signals)
             await asyncio.sleep(max(1,POLL-elapsed))
