@@ -1,33 +1,14 @@
-# Smallfish Public Signal Mode v6
+# Smallfish Public Signal V8
 
-Railway-ready MEXC Futures signal scanner. Public market data only: no MEXC API key/secret and no order placement.
+Railway-ready, signal-only MEXC Futures scanner. No MEXC API key/secret and no orders.
 
-## V6 logic
-The scanner is designed around the pattern visible in the reference LINK setup:
+Pattern: liquidity sweep -> 10m CHoCH -> fresh 1H/15m bias -> 5m confirmation -> 1m trigger -> entry zone.
 
-**Liquidity sweep → 10m CHoCH → 1H/15m bias → 5m confirmation → 1m trigger**
-
-### LONG
-- 1H and 15m must support bullish bias.
-- A fresh **sell-side liquidity sweep** must be detected on derived 10m candles: price takes a recent low and closes back above it.
-- After the sweep, a **10m CHoCH** must occur.
-- 5m must confirm bullish momentum without requiring an already exhausted move.
-- 1m must show a fresh reclaim/break trigger.
-- Order-book imbalance should support bids and volume must not be dead.
-- Entry is rejected if price is already too far above the sweep or too close to the recent high.
-
-### SHORT
-Mirror logic:
-- 1H/15m bearish bias.
-- Buy-side liquidity sweep.
-- 10m bearish CHoCH.
-- 5m bearish confirmation.
-- 1m rejection/break trigger.
-- Ask-side order-book imbalance and usable volume.
-- Reject late entries near the recent low or too far below the sweep.
-
-## Important
-This is a pattern scanner, not a guarantee of profit. It tries to detect the same *sequence* of market events rather than simply scoring trend indicators after a move has already happened.
-
-## Railway
-Docker runs `python app.py`. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Railway. No MEXC credentials are required.
+V8 fixes:
+- never labels an extended setup as LONG/SHORT when location fails; it is WAIT;
+- uses an entry zone instead of treating the current market price as the only entry;
+- separates fresh setup age from older structural sweeps;
+- caches 1m/5m/15m/1h candles and order book to reduce MEXC request pressure;
+- retries API calls and uses cached candles on transient empty responses;
+- requires fresh sweep, higher-timeframe alignment, 5m confirmation, 1m trigger, order-book and volume confirmation for alerts;
+- blocks entries that are too close to local extremes or too far from the sweep.
