@@ -1,0 +1,12 @@
+PyYAML>=6.0,<7
+websockets>=12,<13
+aiohttp>=3.9,<4
+numpy>=1.26,<3
+orjson>=3.9,<4
+python-dotenv>=1,<2
+python-telegram-bot>=21,<22
+aiosmtplib>=3,<4
+plotext>=5.2,<6
+rich>=13,<14
+candlestick-chart>=3.1,<4
+psutil>=5.9,<7

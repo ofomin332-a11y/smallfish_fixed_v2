@@ -1,1 +1,1 @@
-web: python src/app.py --telegram
+worker: python /app/run.py --telegram
