@@ -26,6 +26,7 @@ ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SECONDS", "900"))
 # This is deliberately signal-only: no account endpoints, no orders,
 # no API key/secret and no exchange credentials are required.
 MEXC_PUBLIC = "https://api.mexc.com"
+MEXC_CONTRACT = "https://contract.mexc.com"
 FUTURES_KLINE = "/api/v1/contract/kline"
 SPOT_KLINE = "/api/v3/klines"
 FUTURES_DEPTH = "/api/v1/contract/depth"
@@ -97,45 +98,43 @@ def parse_candles(data):
             return parse_candles(d)
     return []
 
-async def get_json(session, path, params):
-    url=MEXC_PUBLIC+path
+async def get_json(session, path, params, base=MEXC_PUBLIC):
+    url=base+path
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as r:
         if r.status != 200:
             raise RuntimeError(f"HTTP {r.status} {path}")
         return await r.json(content_type=None)
 
 async def candles(session, symbol, interval):
-    # Try public MEXC futures market data first. No authentication.
-    try:
-        d=await get_json(session, f"{FUTURES_KLINE}/{symbol.replace('USDT','_USDT')}",
-                         {"interval": interval, "limit": 120})
-        c=parse_candles(d)
-        if len(c) >= 30:
-            return c
-    except Exception:
-        pass
-    # Fallback to public spot data; useful because price discovery is closely related.
-    spot_interval={"Min1":"1m","Min5":"5m","Min15":"15m","Hour1":"1h"}[interval]
-    d=await get_json(session, SPOT_KLINE,
-                    {"symbol":symbol,"interval":spot_interval,"limit":120})
-    c=parse_candles(d)
+    # MEXC perpetual-futures market data uses contract.mexc.com, not api.mexc.com.
+    # The futures API expects Min1/Min5/Min15/Min60 rather than 1m/5m/15m/1h.
+    contract_interval = {
+        "Min1": "Min1",
+        "Min5": "Min5",
+        "Min15": "Min15",
+        "Hour1": "Min60",
+    }[interval]
+    fs = symbol.replace("USDT", "_USDT")
+    d = await get_json(
+        session,
+        f"{FUTURES_KLINE}/{fs}",
+        {"interval": contract_interval},
+        base=MEXC_CONTRACT,
+    )
+    c = parse_candles(d)
     if len(c) < 30:
-        raise RuntimeError(f"no usable candles for {symbol} {interval}")
-    return c
+        raise RuntimeError(f"no usable futures candles for {symbol} {interval}: {len(c)}")
+    return c[-120:]
 
 async def depth(session, symbol):
     fs=symbol.replace("USDT","_USDT")
-    try:
-        d=await get_json(session, f"{FUTURES_DEPTH}/{fs}", {"limit":20})
-        data=d.get("data",d) if isinstance(d,dict) else d
-        bids=data.get("bids",[]) if isinstance(data,dict) else []
-        asks=data.get("asks",[]) if isinstance(data,dict) else []
-        if bids and asks:
-            return bids,asks
-    except Exception:
-        pass
-    d=await get_json(session, SPOT_DEPTH, {"symbol":symbol,"limit":20})
-    return d.get("bids",[]), d.get("asks",[])
+    d=await get_json(session, f"{FUTURES_DEPTH}/{fs}", {"limit":20}, base=MEXC_CONTRACT)
+    data=d.get("data",d) if isinstance(d,dict) else d
+    bids=data.get("bids",[]) if isinstance(data,dict) else []
+    asks=data.get("asks",[]) if isinstance(data,dict) else []
+    if not bids or not asks:
+        raise RuntimeError(f"empty futures order book for {symbol}")
+    return bids,asks
 
 def score_setup(c1h,c15,c5,c1m,bids,asks):
     close1=c1h[-1][4]
