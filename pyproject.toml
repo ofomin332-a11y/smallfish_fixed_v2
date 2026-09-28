@@ -1,0 +1,55 @@
+[tool.poetry]
+name = "smallfish"
+version = "1.0.3"
+description = "Open-source signal-fusion scalping engine — microstructure tools for the small fish."
+license = "Apache-2.0"
+authors = ["Azer LTIFI azseza@tutamail.org"]
+packages = [
+    { include = "core", from = "src" },
+    { include = "exec", from = "src" },
+    { include = "gateway", from = "src" },
+    { include = "marketdata", from = "src" },
+    { include = "monitor", from = "src" },
+    { include = "remote", from = "src" },
+    { include = "signals", from = "src" },
+    { include = "strategies", from = "src" },
+    { include = "smallfish_cli", from = "src" },
+    { include = "app.py", from = "src" },
+    { include = "backtest.py", from = "src" },
+]
+
+[tool.poetry.scripts]
+smallfish = "smallfish_cli.entry:main_live"
+smallfish-backtest = "smallfish_cli.entry:main_backtest"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pyyaml = "^6.0"
+websockets = "^12.0"
+aiohttp = "^3.9"
+numpy = "^1.26"
+orjson = "^3.9"
+python-dotenv = "^1.0"
+python-telegram-bot = "^21.0"
+aiosmtplib = "^3.0"
+plotext = "^5.2"
+rich = "^13.0"
+candlestick-chart = "^3.1"
+psutil = "^5.9"
+dydx-v4-client = {version = "^1.0", optional = true}
+
+[tool.poetry.extras]
+dydx = ["dydx-v4-client"]
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4"
+pytest-asyncio = "^0.23"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

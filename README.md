@@ -1,21 +1,615 @@
-# Smallfish — Public Signal Mode
+# Smallfish
 
-Signal-only deployment for Railway.
+> *"He robs from the rich and gives to the poor."*
 
-- Uses MEXC public market data.
-- No MEXC API key or secret is required.
-- Does not place, cancel, or manage orders.
-- Sends qualifying signals to Telegram.
-- Default symbols: SOLUSDT, SUIUSDT, XRPUSDT, DOGEUSDT, ADAUSDT.
-- Multi-timeframe inputs: 1h, 15m, 5m, 1m.
-- Default polling: 30 seconds.
+The markets aren't free. They never were. Institutional players, market makers, and algorithmic
+hedge funds operate with information asymmetry, co-located servers, and order flow privileges
+that retail traders will never have. They see your stops. They hunt your liquidations. They
+front-run your orders. The game is rigged and the house always wins — unless you learn to
+read what the house is doing.
 
-Railway variables:
-TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
+**Smallfish** is an open-source, signal-fusion scalping engine that reads the same
+microstructure footprints the big players leave behind — spoofing patterns, iceberg orders,
+order book sweeps, whale bursts, CVD flow, trade intensity, liquidity thinning, micro-volatility
+spikes, and absorption walls — and uses them to swim in the wake of the whales instead
+of being swallowed by them.
 
-Optional:
-SYMBOLS
-POLL_SECONDS
-MIN_SCORE
-ALERT_COOLDOWN_SECONDS
+This isn't financial advice. This is a tool. A crowbar for the locked door.
+
+```
+  ><(((o>  smallfish  <o)))><
+```
+
+## Philosophy
+
+The name says it all. We are the small fish. We don't move markets. We don't have Bloomberg
+terminals or dark pool access. But we have pattern recognition, we have code, and we have
+each other. By open-sourcing this engine, we ensure that the tools of the powerful are
+available to everyone.
+
+- **Transparency over secrecy.** Every signal, every weight, every risk gate is visible and auditable.
+- **Community over profit.** This project is Apache 2.0 licensed. Fork it. Improve it. Share it.
+- **Survival over greed.** The risk management is designed to keep you alive, not to make you rich overnight. The kill switch exists because the market will always be there tomorrow.
+
+## Architecture
+
+```
+Exchange WebSocket (L2 book + trades)     ← ExchangeWS ABC (Bybit or Binance)
+  → OrderBook / TradeTape (src/marketdata/)
+    → Feature Extraction (src/marketdata/features.py)
+      → 13 Signal Scorers (src/signals/)
+        → Signal Fusion + Quality Gate (src/signals/fuse.py)
+          → Risk Sizing + Pre-Trade Gates (src/exec/risk.py)
+            → Smart Order Router (src/exec/router.py)  ← ExchangeREST ABC
+              → OCO Brackets + Trailing Stop (src/exec/oco.py)
+```
+
+### Multi-Exchange Gateway
+
+Smallfish uses an exchange-agnostic gateway layer. Bybit, Binance, MEXC, and dYdX v4
+perpetual futures are supported through abstract interfaces:
+
+```
+gateway/
+├── base.py           # ExchangeREST + ExchangeWS ABCs, normalized types
+├── factory.py        # create_rest() / create_ws() — dispatch by exchange name
+├── symbol_map.py     # Symbol format conversion (BTCUSDT ↔ BTC_USDT / BTC-USD)
+├── rest.py           # Bybit REST adapter
+├── bybit_ws.py       # Bybit WebSocket adapter
+├── binance_rest.py   # Binance REST adapter
+├── binance_ws.py     # Binance WebSocket adapter
+├── mexc_rest.py      # MEXC Futures REST adapter
+├── mexc_ws.py        # MEXC Futures WebSocket adapter
+├── dydx_rest.py      # dYdX v4 Indexer REST + SDK adapter
+├── dydx_ws.py        # dYdX v4 Indexer WebSocket adapter
+└── persistence.py    # CSV logging
+```
+
+Switch between exchanges with a single config line:
+```yaml
+exchange: "bybit"   # or "binance", "mexc", "dydx"
+```
+
+## Signals (13 total)
+
+Smallfish fuses 13 independent microstructure signals across 4 weight groups.
+Each signal scorer returns `(long_score, short_score)` in [0, 1].
+
+### Core Signals (w) — 47% weight
+
+| Signal | Weight | File | Description |
+|--------|--------|------|-------------|
+| **OBI** (Order Book Imbalance) | 22% | `obi.py` | Bid/ask volume imbalance + rate of change + micro-pressure. Measures whether buyers or sellers are stacking the book harder. |
+| **PRT** (Pull & Replace Trap) | 10% | `prt.py` | Spoofing detection — when one side's cancel rate spikes while the mid-price doesn't move, someone is faking pressure. Fade the fake side. |
+| **UMOM** (Micro-Momentum) | 15% | `umom.py` | 1s vs 5s EMA crossover with volatility gate + trade flow confirmation. Captures short-term momentum shifts validated by actual trade direction. |
+
+### Whale Lens Signals (v) — 16% weight
+
+| Signal | Weight | File | Description |
+|--------|--------|------|-------------|
+| **LTB** (Large Trade Burst) | 8% | `whale.py` | Detects institutional-size trade bursts (>5x median or >$50K) within a 2s window. Big money moving fast = directional intent. |
+| **SWEEP** (Order Book Sweep) | 5% | `whale.py` | Multi-level aggressive order clearing 3+ price levels. Someone is paying spread to get filled NOW — that's conviction. |
+| **ICE** (Iceberg Refill) | 3% | `whale.py` | Hidden order detection via repeated refills at the same price level (4+ refills in 5s). Icebergs = accumulation/distribution by large players. |
+
+### Meta Signals (x) — 7% weight
+
+| Signal | Weight | File | Description |
+|--------|--------|------|-------------|
+| **VWAP** (VWAP Deviation) | 5% | `vwap.py` | Mean-reversion signal based on deviation from 500-trade rolling VWAP. Works best in low-volatility regimes where price tends to revert to fair value. |
+| **REGIME** (Volatility Regime) | 2% | `regime.py` | Classifies current market state (low/normal/high/extreme volatility). Low vol = mean-revert mode, high vol = momentum mode, extreme = stop trading. |
+
+### Microstructure Signals (t) — 30% weight
+
+| Signal | Weight | File | Description |
+|--------|--------|------|-------------|
+| **CVD** (Cumulative Volume Delta) | 7% | `cvd.py` | Net buy vs sell flow over a 5s window. Detects flow acceleration and price-flow divergence (price up but CVD down = exhaustion). |
+| **TPS** (Trades Per Second) | 5% | `tps.py` | Trade intensity ratio (1s vs 30s baseline). Sudden spikes in trade rate signal urgency. Combined with buy/sell ratio for direction. |
+| **LIQ** (Liquidity Thinness) | 6% | `liq.py` | Measures how thin the order book is within 10 ticks + directional asymmetry. Thin book on one side = vulnerability to a move. Combined with OBI for confirmation. |
+| **MVR** (Micro-Volatility Ratio) | 6% | `mvr.py` | Short-term (2s) vs long-term (30s) realized volatility ratio. MVR > 1 = breakout regime, MVR < 1 = mean-revert. Combined with momentum for direction. |
+| **ABSORB** (Absorption Detection) | 6% | `absorb.py` | Detects large volume absorbed at a price level without the price moving. Someone is defending that level — walls that actually hold signal institutional intent. |
+
+### Signal Fusion
+
+All 13 signals are weighted-summed into a single raw score per direction (long/short).
+The raw difference goes through a sigmoid with steepness `alpha` to produce a confidence
+score in [0, 1]. Entry requires:
+
+1. Confidence >= `C_enter` threshold
+2. At least `min_signals` signals agreeing (score > 0.05 in the same direction)
+3. All quality gates passing (spread, latency, funding window, drawdown, kill switch)
+
+Weights adapt in real-time based on per-signal edge tracking when `adaptive.enabled: true`.
+
+## Trading Modes
+
+### Signal Fusion (default)
+The core scalping engine. Fuses 13 microstructure signals into a single directional
+confidence score, enters via post-only limit orders, manages positions with OCO
+brackets and trailing stops.
+
+### Multigrid (optional)
+A multi-level grid strategy that places layered buy/sell orders around a dynamic
+center price (VWAP or mid). The grid bias shifts based on the signal fusion
+confidence — bullish signals shift the grid upward, bearish signals shift it down.
+Grid profits are harvested automatically as price oscillates through levels.
+
+Activate with `--multigrid` or set `multigrid.enabled: true` in config.
+
+### Terminal Dashboard
+Live split-panel dashboard rendered directly in your terminal using Rich + py-candlestick-chart:
+
+- **Candlestick chart** — real 1-minute OHLCV candles with position entry/SL/TP markers
+- **Equity curve** — running equity line (green when up, red when down)
+- **Signal strength** — horizontal bars showing each of the 13 signal scores
+- **System info** — CPU usage, temperature, memory, uptime (Raspberry Pi friendly)
+- **Live metrics** — PnL, win rate, profit factor, avg win/loss, drawdown, daily R usage
+- **Position tracker** — open positions with uPnL, SL, TP levels
+- **7-day history** — daily PnL breakdown with win/loss counts
+- **Recent trades** — last 10 completed trades with R-multiple and exit reason
+
+Designed for headless Raspberry Pi deployments where you SSH in to check on things.
+
+Activate with `--dashboard` or set `dashboard.enabled: true` in config.
+
+## Risk Management
+
+- **Per-trade risk**: 0.5-3.5% of equity (configurable per profile)
+- **Drawdown tiers**: Automatically reduces position size as drawdown increases (full → half → quarter → stop)
+- **Daily loss limit**: Configurable R-multiples → kill switch (10R conservative, 30R ultra)
+- **Rolling win-rate gate**: Blocks entries when rolling WR(20) < 20%, halves size when WR < 30%
+- **Slippage monitoring**: Kill switch after 3 slippage breaches
+- **Spread gate**: Won't trade if spread > 2 ticks
+- **Latency gate**: Won't trade if latency > 80ms
+- **Funding avoidance**: Stays flat 3 minutes around funding times
+- **Cooldown**: Configurable pause after a losing trade (20s-60s by profile)
+- **Adaptive weights**: Per-signal edge tracking adjusts weights in real-time
+
+## Risk Profiles
+
+4 profiles fee-optimized from 30-day parameter sweeps on 5m candles (ADA+DOGE+XRP+SUI):
+
+| Profile | Risk/Trade | SL | TP | Trail | R:R | Partial TP | Min Signals | C_enter |
+|---------|-----------|-----|-----|-------|-----|------------|-------------|---------|
+| **conservative** | 0.5% | 0.80x | 2.00x | 30% | 2.5:1 | No | 5/13 | 0.58 |
+| **balanced** | 1.5% | 0.80x | 2.00x | 25% | 2.5:1 | No | 4/13 | 0.55 |
+| **aggressive** | 2.5% | 1.00x | 2.50x | 20% | 2.5:1 | No | 3/13 | 0.58 |
+| **ultra** | 3.5% | 1.00x | 2.50x | 20% | 2.5:1 | No | 3/13 | 0.52 |
+
+Key findings from parameter sweeps:
+- `partial_tp=False` always — partial TP cuts avg win in half, destroying the edge
+- `breakeven_R=disabled` always — early breakeven move chops winners via noise
+- `sl_range_mult=0.80-1.00` — wider SL boosts WR from 50% to 70%, reduces whipsaw
+- `tp_range_mult=2.00-2.50` — wider TP lets winners run further
+- `trail_pct=0.20-0.25` — tighter trailing is the single biggest lever (3x return improvement)
+- `trail_activation_R=0.3` — start trailing early to lock profit
+
+## Remote Control
+
+### Telegram Bot
+
+Control and monitor your Smallfish instance from anywhere via Telegram.
+
+#### Setup
+
+1. Open Telegram and search for **@BotFather**
+2. Send `/newbot`, choose a name (e.g. `Smallfish Trading`) and a username ending in `bot`
+3. BotFather replies with a **token** — copy it
+4. Open a chat with your new bot, tap **Start**, and send any message (e.g. `hello`)
+5. Open this URL in your browser (replace `<TOKEN>` with your token):
+   ```
+   https://api.telegram.org/bot<TOKEN>/getUpdates
+   ```
+6. Find `"chat":{"id":123456789}` in the JSON — that number is your **chat ID**
+7. Add both to your `.env`:
+   ```bash
+   TELEGRAM_BOT_TOKEN="your_bot_token_here"
+   TELEGRAM_CHAT_ID="your_chat_id_here"
+   ```
+8. Run with the `--telegram` flag:
+   ```bash
+   BYBIT_TESTNET=true python src/app.py --mode aggressive --telegram
+   ```
+9. Send `/help` to your bot to verify it works
+
+**Optional:** Send `/setcommands` to @BotFather and paste the command list below to enable autocomplete in Telegram:
+```
+status - Account summary + positions
+stats - Live stats: equity, PnL, WR, Sharpe
+balance - Detailed balance & margin info
+equity - Equity curve & drawdown
+trades - Recent trade history
+pnl - Daily P&L breakdown
+signals - Current signal scores
+symbols - Active symbols
+kill - Emergency stop all trading
+resume - Resume after kill switch
+close - Close position(s)
+cooldown - Pause trading N minutes
+mode - Switch risk profile
+sl - Move stop-loss
+tp - Move take-profit
+notify - Toggle trade notifications
+alert - Fine-grained alert control
+config - View current settings
+grid - Multigrid status
+cashout - Withdraw profits
+wallet - Cold wallet info
+backtest - Quick backtest report
+help - List all commands
+```
+
+#### Commands
+
+**Monitoring**
+- `/status` — Account summary + open positions
+- `/stats` — Live stats: equity, PnL, win rate, profit factor, drawdown, Sharpe
+- `/balance` — Detailed balance: equity, available margin, unrealized PnL
+- `/equity` — Equity curve and drawdown info
+- `/trades` — Recent trade history with PnL and R-multiples
+- `/pnl [days]` — Daily P&L breakdown (default 7 days)
+- `/signals` — Current signal scores for all 13 signals
+- `/symbols` — Active symbols with position info
+
+**Control**
+- `/kill` — Emergency stop all trading
+- `/resume` — Resume after kill switch
+- `/close [symbol]` — Close specific position or all positions
+- `/cooldown [minutes]` — Pause trading for N minutes (default 5)
+- `/mode <profile>` — Switch risk profile (conservative/balanced/aggressive/ultra)
+
+**Position Management**
+- `/sl <symbol> <price>` — Move stop-loss for open position
+- `/tp <symbol> <price>` — Move take-profit for open position
+
+**Notifications**
+- `/notify [on|off]` — Toggle trade-by-trade fill notifications
+- `/alert [dd|trade|all] [on|off]` — Fine-grained alert control (kill switch alerts always on)
+
+**Finance**
+- `/cashout [amount]` — Withdraw profits to cold wallet (preview + confirm flow)
+- `/wallet` — Cold wallet address and withdrawal history
+- `/backtest [symbol] [days]` — Run a quick backtest and report ROI
+
+**Config**
+- `/config` — View current settings
+- `/grid` — Multigrid status
+
+#### Cash Out Setup
+
+To use `/cashout`, configure a cold wallet address in `.env`:
+```bash
+COLD_WALLET_ADDRESS="TRxYourTronUSDTAddress"
+COLD_WALLET_CHAIN="TRC20"          # TRC20 (Tron) — cheapest USDT fees (~$1)
+MIN_WITHDRAWAL="10"                 # minimum $ to withdraw
+```
+
+The cashout flow closes all open positions, submits a USDT withdrawal, and pauses trading for 5 minutes while equity syncs. Always test on testnet first.
+
+### Email Alerts
+Receive email notifications for critical events:
+- Kill switch triggered
+- Drawdown exceeds threshold
+- Daily summary report
+
+## Getting Started
+
+### Requirements
+- Python 3.10+
+- API key for Bybit, Binance, MEXC, or dYdX v4 with trading permissions
+
+### Installation
+
+```bash
+# With Poetry (recommended)
+poetry install
+
+# Or with pip
+pip install pyyaml websockets aiohttp numpy orjson python-dotenv plotext rich
+pip install candlestick-chart psutil                      # dashboard: candle charts + system info
+pip install python-telegram-bot aiosmtplib                # optional: remote control
+```
+
+### Exchange Setup
+
+#### Bybit
+
+1. Go to [bybit.com](https://www.bybit.com) → API Management → Create New Key
+2. Enable **Contract Trading** permissions (read + write)
+3. For testnet: use [testnet.bybit.com](https://testnet.bybit.com) and create a separate API key
+4. Add to your `.env`:
+```bash
+BYBIT_API_KEY=your_api_key_here
+BYBIT_API_SECRET=your_api_secret_here
+BYBIT_TESTNET=true    # remove or set to false for live trading
+```
+
+#### Binance
+
+1. Go to [binance.com](https://www.binance.com) → API Management → Create API
+2. Select **System Generated** key type
+3. Enable **Futures** permissions (read + write) — do NOT enable withdrawal
+4. Restrict to your IP address (recommended for live trading)
+5. For testnet: go to [testnet.binancefuture.com](https://testnet.binancefuture.com), log in with GitHub, and create API keys
+6. Add to your `.env`:
+```bash
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_api_secret_here
+BINANCE_TESTNET=true  # remove or set to false for live trading
+```
+
+#### MEXC (Recommended for lowest fees)
+
+1. Go to [mexc.com](https://www.mexc.com) → Profile → API Management
+2. Create a new API key — enable **Futures Trading** permission
+3. MEXC has **no futures testnet** — start with conservative profile and small equity
+4. Add to your `.env`:
+```bash
+MEXC_API_KEY=your_access_key_here
+MEXC_API_SECRET=your_secret_key_here
+```
+
+#### dYdX v4
+
+1. Create a dYdX v4 wallet at [dydx.trade](https://dydx.trade)
+2. For testnet: use [v4testnet.dydx.exchange](https://v4testnet.dydx.exchange)
+3. Install the optional SDK: `pip install dydx-v4-client` (or `poetry install -E dydx`)
+4. Add to your `.env`:
+```bash
+DYDX_ADDRESS=your_dydx_address_here
+DYDX_MNEMONIC="your wallet mnemonic phrase here"
+DYDX_TESTNET=true     # remove for mainnet
+```
+
+Set the exchange in `config/default.yaml`:
+```yaml
+exchange: "mexc"   # or "bybit", "binance", "dydx"
+```
+
+#### Raspberry Pi Deployment
+
+```bash
+# 1. Install Python 3.10+ and dependencies
+sudo apt install python3 python3-pip python3-venv
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt   # or: poetry install
+
+# 2. Configure .env with your API keys (see above)
+
+# 3. Run on testnet first (always!)
+BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard --backfill
+
+# 4. Run headless with Telegram monitoring
+nohup python src/app.py --mode aggressive --telegram > smallfish.log 2>&1 &
+
+# 5. Check on it
+tail -f smallfish.log          # or SSH and check dashboard
+# Or send /status to your Telegram bot
+
+# 6. When confident, switch to live
+# Edit .env: remove BYBIT_TESTNET=true (or BINANCE_TESTNET=true)
+# Start with conservative profile first!
+python src/app.py --mode conservative --telegram --dashboard
+```
+
+### Configuration
+
+```bash
+# Review trading parameters
+# Edit config/default.yaml
+
+# Set up Telegram bot (optional)
+# Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env
+
+# Set up email alerts (optional)
+# Add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, ALERT_EMAIL_TO to your .env
+```
+
+### Run
+
+```bash
+# --- Live Trading (Bybit) ---
+
+# Testnet — always start here
+BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard
+
+# With backfilled 7D performance history
+BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard --backfill
+
+# Dashboard + multigrid + Telegram — the full stack
+BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard --multigrid --telegram
+
+# Auto-select top 5 symbols by volume+volatility
+AUTO_SYMBOLS=5 BYBIT_TESTNET=true python src/app.py --mode aggressive --dashboard
+
+# --- Live Trading (Binance) ---
+
+BINANCE_TESTNET=true python src/app.py --mode aggressive --dashboard
+
+# --- Backtesting ---
+
+# Single symbol
+python src/backtest.py --symbol BTCUSDT --days 30 --mode aggressive --equity 50
+
+# On Binance data
+python src/backtest.py --symbol BTCUSDT --days 30 --mode aggressive --equity 50 --exchange binance
+
+# Multiple symbols
+python src/backtest.py --symbols BTCUSDT ETHUSDT SOLUSDT --days 14 --mode aggressive --equity 50
+
+# Auto-scan top N symbols and backtest them
+python src/backtest.py --auto 5 --days 7 --mode aggressive --equity 50
+
+# With terminal charts (trade PnL + equity curve + signal weights)
+python src/backtest.py --auto 5 --days 7 --mode aggressive --equity 50 --chart
+
+# Sweep all 4 profiles and compare
+python src/backtest.py --symbols BTCUSDT ETHUSDT --days 30 --sweep --equity 50
+
+# --- Parameter Sweep ---
+
+# Find optimal profile parameters
+python src/param_sweep.py --symbol BTCUSDT --days 7 --equity 50
+
+# Multi-symbol with parallel workers
+python src/param_sweep.py --symbols BTCUSDT ETHUSDT --days 7 --equity 50 --workers 4
+```
+
+### Tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+## Project Structure
+
+```
+src/
+├── app.py                 # Main async event loop (multi-exchange)
+├── backtest.py            # Backtesting engine with 4 profiles
+├── param_sweep.py         # Parameter sweep for optimal profile tuning
+├── core/
+│   ├── types.py           # Data types (Order, Position, Trade, etc.)
+│   ├── state.py           # Runtime state management
+│   ├── profiles.py        # Risk profiles (conservative → ultra) + apply_profile()
+│   ├── ringbuffer.py      # Fixed-size circular buffer
+│   └── utils.py           # Math utilities (sigmoid, EMA, simulated time, etc.)
+├── marketdata/
+│   ├── book.py            # L2 order book with delta processing
+│   ├── tape.py            # Trade tape with rolling analytics
+│   ├── features.py        # Feature extraction pipeline
+│   └── scanner.py         # Symbol scanner for top performers (exchange-agnostic)
+├── signals/
+│   ├── obi.py             # Order Book Imbalance signal
+│   ├── prt.py             # Pull & Replace Trap signal
+│   ├── umom.py            # Micro-Momentum signal
+│   ├── whale.py           # Whale activity signals (LTB, SWEEP, ICE)
+│   ├── vwap.py            # VWAP deviation signal
+│   ├── regime.py          # Volatility regime signal
+│   ├── cvd.py             # Cumulative Volume Delta signal
+│   ├── tps.py             # Trades Per Second signal
+│   ├── liq.py             # Liquidity Thinness signal
+│   ├── mvr.py             # Micro-Volatility Ratio signal
+│   ├── absorb.py          # Absorption Detection signal
+│   └── fuse.py            # Signal fusion + adaptive weights
+├── strategies/
+│   └── multigrid.py       # Multi-level grid trading strategy
+├── exec/
+│   ├── router.py          # Smart order routing (PostOnly → reprice → IOC)
+│   ├── oco.py             # OCO bracket + trailing stop management
+│   └── risk.py            # Position sizing + pre-trade gates
+├── gateway/
+│   ├── base.py            # ExchangeREST + ExchangeWS ABCs + normalized types
+│   ├── factory.py         # Exchange factory: create_rest() / create_ws()
+│   ├── symbol_map.py      # Symbol format conversion (BTCUSDT ↔ BTC_USDT / BTC-USD)
+│   ├── rest.py            # Bybit REST adapter
+│   ├── bybit_ws.py        # Bybit WebSocket adapter
+│   ├── binance_rest.py    # Binance REST adapter
+│   ├── binance_ws.py      # Binance WebSocket adapter
+│   ├── mexc_rest.py       # MEXC Futures REST adapter
+│   ├── mexc_ws.py         # MEXC Futures WebSocket adapter
+│   ├── dydx_rest.py       # dYdX v4 Indexer REST + SDK adapter
+│   ├── dydx_ws.py         # dYdX v4 Indexer WebSocket adapter
+│   └── persistence.py     # CSV logging (decisions, orders, trades)
+├── monitor/
+│   ├── metrics.py         # Performance analytics
+│   ├── heartbeat.py       # Health monitoring + state snapshots
+│   └── dashboard.py       # Terminal dashboard (Rich + candlestick-chart + plotext)
+└── remote/
+    ├── telegram_bot.py    # Telegram bot for remote control
+    └── email_alert.py     # Email notifications for critical events
+```
+
+## Golden Fish
+
+The golden path — fee-optimized commands for maximum revenue. Use MEXC (0% maker / 0.01% taker)
+with 5-minute candles on cheap volatile assets. This is the configuration that turns smallfish
+into a golden fish.
+
+### Backtest (validate before going live)
+
+```bash
+# Sweep all profiles on the 4 golden assets — no fees (raw signal edge)
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --days 30 --sweep --interval 5 --equity 50
+
+# Sweep with MEXC fees (the only fee tier that works)
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --days 30 --sweep --interval 5 --equity 50 --maker-fee 0.0 --taker-fee 0.0001
+
+# Single aggressive backtest on MEXC data
+smallfish-backtest --symbol ADAUSDT --days 30 --mode aggressive --interval 5 --equity 50 --exchange mexc
+
+# Quick 7-day validation
+smallfish-backtest --symbols ADAUSDT DOGEUSDT --days 7 --mode aggressive --interval 5 --equity 50 --maker-fee 0.0 --taker-fee 0.0001 --chart
+```
+
+### Live Trading (MEXC)
+
+```bash
+# Conservative first — no testnet on MEXC, so start safe
+smallfish --mode conservative --dashboard
+
+# Aggressive with dashboard + Telegram monitoring
+smallfish --mode aggressive --dashboard --telegram
+
+# Ultra mode — maximum compounding (high risk)
+smallfish --mode ultra --dashboard --telegram
+
+# Full stack: multigrid + dashboard + Telegram
+smallfish --mode aggressive --dashboard --multigrid --telegram
+```
+
+### Fee Viability Reference
+
+| Exchange | Maker | Taker | Verdict |
+|----------|-------|-------|---------|
+| **MEXC** | 0.000% | 0.010% | All profiles profitable |
+| Near-zero | 0.005% | 0.005% | All profiles profitable |
+| VIP1 | 0.010% | 0.035% | All profiles negative |
+| Standard | 0.020% | 0.055% | Devastating |
+| dYdX | 0.010% | 0.050% | All profiles negative |
+
+### Golden Rules
+
+1. **Only cheap volatile assets**: ADA, DOGE, XRP, SUI — never BTC/ETH (fee ratio too high)
+2. **Only 5m candles**: 1m is too noisy for fees, 30m kills signal quality
+3. **Only MEXC or near-zero fee exchanges**: anything above 0.01%/side kills the edge
+4. **Start conservative**: validate fills and slippage before scaling up
+5. **Respect the kill switch**: the market will always be there tomorrow
+
+### Expected Performance (MEXC fees, 7d, 5m, $45 start)
+
+| Profile | Return | Final $ | Win Rate | Profit Factor | Max DD | Trades |
+|---------|--------|---------|----------|---------------|--------|--------|
+| conservative | +28.5% | $57.84 | 68.0% | 1.78 | 20.4% | 269 |
+| balanced | +76.3% | $79.32 | 67.0% | 1.37 | 46.7% | 412 |
+| **aggressive** | **+220.6%** | **$144.26** | **73.4%** | **1.61** | **69.3%** | **403** |
+| ultra | +22312% | $10085 | 72.0% | 4.76 | 95.6% | 1740 |
+
+Reproduced with:
+```bash
+smallfish-backtest --symbols ADAUSDT DOGEUSDT XRPUSDT SUIUSDT --equity 45 --sweep --maker-fee 0.0 --taker-fee 0.0001 --exchange mexc --interval 5
+```
+
+> These are backtest results on ~7 days of MEXC 5m data (API returns max 2000 candles per symbol).
+> Live performance will be lower due to slippage, partial fills, and latency. Expect 30-50% of
+> backtest returns in live trading. With aggressive at 30-50% live efficiency: **$45 → $75-110 in a week**.
+>
+> **Fee gotcha**: `--taker-fee` is a decimal, not a percentage. MEXC 0.01% = `0.0001`. Using `0.01`
+> would mean 1% fee and everything goes negative. Double-check your decimals.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Free as in freedom. Use it, fork it, improve it, share it.
+
+## Disclaimer
+
+This is a trading bot. Cryptocurrency trading involves substantial risk of loss. Markets
+are volatile, leveraged, and unforgiving. Past performance — including backtests — is not
+indicative of future results. The authors and contributors accept no liability for financial
+losses incurred through the use of this software.
+
+Start with testnet. Start with small amounts. Respect the kill switch.
+
+> *"The market can stay irrational longer than you can stay solvent."*
+> *— but the market can't stay irrational longer than code can stay patient.*
