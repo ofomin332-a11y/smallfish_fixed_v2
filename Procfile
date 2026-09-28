@@ -1,1 +1,1 @@
-worker: python /app/run.py --telegram
+worker: python app.py
